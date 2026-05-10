@@ -510,11 +510,11 @@ static void process_char_input(int key) {
                 /* Shield: activate for 1 second */
                 g_state.ch.shield_timer = 30;
             } else if (item == 4) {
-                /* Gun: damage attacker */
-                g_state.attacker_hp--;
-                if (g_state.attacker_hp <= 0) {
-                    g_state.attacker_hp = 0;
-                    g_state.game_over = 1;
+                /* Gun: spawn a bullet traveling up */
+                if (g_state.num_bullets < MAX_BULLETS) {
+                    g_state.bullets[g_state.num_bullets][0] = g_state.ch.x;
+                    g_state.bullets[g_state.num_bullets][1] = g_state.ch.y;
+                    g_state.num_bullets++;
                 }
             }
         }
@@ -650,6 +650,39 @@ static void game_tick(void) {
                 g_state.piece_r, g_state.piece_c, cells);
     if (char_hit_by_piece(cells) && g_state.ch.stun_timer == 0) {
         g_state.ch.stun_timer = STUN_TICKS;
+    }
+
+    /* bullet physics */
+    for (int i = 0; i < g_state.num_bullets; i++) {
+        g_state.bullets[i][1]--; /* move up */
+        int bx = g_state.bullets[i][0];
+        int by = g_state.bullets[i][1];
+        int removed = 0;
+        
+        if (by < 0) {
+            /* hit boss? Boss is 2x2, starting at piece_c */
+            int boss_left = g_state.piece_c;
+            int boss_right = g_state.piece_c + 1;
+            if (bx >= boss_left && bx <= boss_right) {
+                if (g_state.attacker_hp > 0) {
+                    g_state.attacker_hp--;
+                    if (g_state.attacker_hp <= 0) {
+                        g_state.attacker_hp = 0;
+                        g_state.game_over = 1;
+                    }
+                }
+            }
+            removed = 1; /* Bullet disappears after going off screen or hitting boss */
+        }
+        
+        if (removed) {
+            for (int j = i; j < g_state.num_bullets - 1; j++) {
+                g_state.bullets[j][0] = g_state.bullets[j+1][0];
+                g_state.bullets[j][1] = g_state.bullets[j+1][1];
+            }
+            g_state.num_bullets--;
+            i--;
+        }
     }
 }
 

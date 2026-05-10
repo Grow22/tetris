@@ -148,8 +148,8 @@ static void render(void) {
     int board_h = BOARD_H + 2;
     int board_w = BOARD_W * CELL_W + 2;
     int start_y = (max_y - board_h) / 2;
+    if (start_y < 4) start_y = 4; /* Reserve top 4 lines for boss */
     int start_x = (max_x - board_w) / 2 - 8;
-    if (start_y < 0) start_y = 0;
     if (start_x < 0) start_x = 0;
 
     erase();
@@ -242,6 +242,38 @@ static void render(void) {
             }
             attroff(COLOR_PAIR(cp) | A_BOLD);
         }
+    }
+
+    /* ── Draw Bullets ── */
+    attron(COLOR_PAIR(COLOR_CHAR) | A_BOLD);
+    for (int i = 0; i < st.num_bullets; i++) {
+        int r = st.bullets[i][1];
+        int c = st.bullets[i][0];
+        int sy = start_y + 1 + r;
+        int sx = start_x + 1 + c * CELL_W;
+        /* Draw if within visible area (including above board for boss hitting) */
+        if (r >= -4 && r < BOARD_H && c >= 0 && c < BOARD_W) {
+            mvprintw(sy, sx, "^^");
+        }
+    }
+    attroff(COLOR_PAIR(COLOR_CHAR) | A_BOLD);
+
+    /* ── Draw Attacker Boss (2x2) ── */
+    if (st.attacker_hp > 0) {
+        int cp = (st.attacker_stun_timer > 0) ? COLOR_CHAR_STUN : COLOR_PIECE_Z;
+        attron(COLOR_PAIR(cp) | A_BOLD);
+        
+        int boss_left = st.piece_c; /* Boss occupies piece_c and piece_c + 1 */
+        for (int br = -2; br < 0; br++) {
+            for (int bc = 0; bc < 2; bc++) {
+                int sy = start_y + 1 + br;
+                int sx = start_x + 1 + (boss_left + bc) * CELL_W;
+                mvprintw(sy, sx, "[]");
+            }
+        }
+        /* Face details */
+        mvprintw(start_y, start_x + 1 + boss_left * CELL_W, "[@@]");
+        attroff(COLOR_PAIR(cp) | A_BOLD);
     }
 
     /* ── Side panel ── */
@@ -468,10 +500,10 @@ int main(int argc, char *argv[]) {
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
         rows = ws.ws_row;
         cols = ws.ws_col;
-        if (rows < 24 || cols < 60) {
+        if (rows < 28 || cols < 60) {
             endwin();
             fprintf(stderr,
-                "Terminal too small! Need at least 60x24, got %dx%d\n",
+                "Terminal too small! Need at least 60x28, got %dx%d\n",
                 cols, rows);
             close(g_sock);
             return 1;
