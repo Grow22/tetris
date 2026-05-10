@@ -1,0 +1,767 @@
+/*
+ * server.c - Tetris Co-op Game Server
+ *
+ * Manages game logic and broadcasts state to two connected clients.
+ * Player 0 = Tetris controller, Player 1 = Character controller.
+ *
+ * System calls used: socket, bind, listen, accept, read, write,
+ *   close, fork, signal/sigaction, pthread_create, open, stat, ioctl
+ */
+
+#include "common.h"
+
+/* ──────────── Global State ──────────── */
+static GameState g_state;
+static int       g_clients[MAX_CLIENTS];  /* client fds */
+static int       g_num_clients = 0;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t g_running = 1;
+static int       g_highscore = 0;
+
+#define HIGHSCORE_FILE "highscore.dat"
+
+/* Forward declarations */
+static void apply_column_gravity(int col);
+static void give_item(int item_type);
+
+/* ──────────── Signal Handler ──────────── */
+static void handle_signal(int sig) {
+    (void)sig;
+    g_running = 0;
+}
+
+/* ──────────── High Score (File I/O) ──────────── */
+static void load_highscore(void) {
+    struct stat st;
+    if (stat(HIGHSCORE_FILE, &st) < 0) {
+        g_highscore = 0;
+        return;
+    }
+    int fd = open(HIGHSCORE_FILE, O_RDONLY);
+    if (fd < 0) { g_highscore = 0; return; }
+    if (read(fd, &g_highscore, sizeof(int)) < 0) {
+        g_highscore = 0;
+    }
+    close(fd);
+}
+
+static void save_highscore(void) {
+    if (g_state.score <= g_highscore) return;
+    g_highscore = g_state.score;
+    int fd = open(HIGHSCORE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    if (write(fd, &g_highscore, sizeof(int)) < 0) {
+        /* ignore error */
+    }
+    close(fd);
+}
+
+/* ──────────── Random Piece ──────────── */
+static int random_piece(void) {
+    return (rand() % 7) + 1;  /* 1..7 */
+}
+
+/* ──────────── Init Game ──────────── */
+static void init_game(void) {
+    memset(&g_state, 0, sizeof(g_state));
+
+    /* empty board */
+    for (int r = 0; r < BOARD_H; r++)
+        for (int c = 0; c < BOARD_W; c++)
+            g_state.board[r][c] = 0;
+
+    /* spawn first piece */
+    srand(time(NULL));
+    g_state.piece_type = random_piece();
+    g_state.piece_rot  = 0;
+    g_state.piece_r    = 0;
+    g_state.piece_c    = BOARD_W / 2;
+    g_state.next_type  = random_piece();
+
+    /* character starts at bottom center */
+    g_state.ch.x = BOARD_W / 2;
+    g_state.ch.y = BOARD_H - 1;
+    g_state.ch.carrying = 0;
+    g_state.ch.stun_timer = 0;
+    g_state.ch.facing = 1;
+    g_state.ch.inv_count = 0;
+    g_state.ch.shield_timer = 0;
+    g_state.ch.drill_timer = 0;
+    g_state.ch.drill_target_x = -1;
+    g_state.ch.drill_target_y = -1;
+    g_state.ch.drill_crack_timer = 0;
+
+    g_state.score = 0;
+    g_state.level = 1;
+    g_state.lines = 0;
+    g_state.game_over = 0;
+    g_state.game_started = 0;
+    g_state.attacker_hp = 5;
+    g_state.attacker_stun_timer = 0;
+    g_state.attacker_spawn_delay = 0;
+}
+
+/* ──────────── Piece Helpers ──────────── */
+
+/* Get absolute board positions of current piece */
+static int piece_cells(int type, int rot, int pr, int pc, int out[4][2]) {
+    if (type < 1 || type > 7) return 0;
+    const Shape *s = &SHAPES[type][rot % 4];
+    for (int i = 0; i < 4; i++) {
+        out[i][0] = pr + s->cells[i][0];
+        out[i][1] = pc + s->cells[i][1];
+    }
+    return 1;
+}
+
+/* Check if piece position is valid */
+static int piece_valid(int type, int rot, int pr, int pc) {
+    int cells[4][2];
+    piece_cells(type, rot, pr, pc, cells);
+    for (int i = 0; i < 4; i++) {
+        int r = cells[i][0], c = cells[i][1];
+        if (r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W)
+            return 0;
+        if (g_state.board[r][c] != 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* Check if character overlaps with piece cells */
+static int char_hit_by_piece(int cells[4][2]) {
+    for (int i = 0; i < 4; i++) {
+        if (cells[i][0] == g_state.ch.y && cells[i][1] == g_state.ch.x)
+            return 1;
+    }
+    return 0;
+}
+
+/* Lock current piece onto board */
+static void lock_piece(void) {
+    int cells[4][2];
+    piece_cells(g_state.piece_type, g_state.piece_rot,
+                g_state.piece_r, g_state.piece_c, cells);
+
+    /* check if character is hit */
+    if (char_hit_by_piece(cells)) {
+        if (g_state.ch.shield_timer > 0) {
+            /* shield is active: attacker gets stunned, defender is safe */
+            g_state.attacker_stun_timer = 45; /* 1.5 seconds */
+        } else {
+            g_state.ch.stun_timer = STUN_TICKS;
+            /* push character to nearest empty cell */
+            for (int dx = 1; dx < BOARD_W; dx++) {
+                int nx = g_state.ch.x + dx;
+                if (nx < BOARD_W && g_state.board[g_state.ch.y][nx] == 0) {
+                    int overlap = 0;
+                    for (int j = 0; j < 4; j++)
+                        if (cells[j][0] == g_state.ch.y && cells[j][1] == nx)
+                            overlap = 1;
+                    if (!overlap) { g_state.ch.x = nx; break; }
+                }
+                nx = g_state.ch.x - dx;
+                if (nx >= 0 && g_state.board[g_state.ch.y][nx] == 0) {
+                    int overlap = 0;
+                    for (int j = 0; j < 4; j++)
+                        if (cells[j][0] == g_state.ch.y && cells[j][1] == nx)
+                            overlap = 1;
+                    if (!overlap) { g_state.ch.x = nx; break; }
+                }
+            }
+        }
+    }
+
+    /* place blocks on board */
+    for (int i = 0; i < 4; i++) {
+        int r = cells[i][0], c = cells[i][1];
+        if (r >= 0 && r < BOARD_H && c >= 0 && c < BOARD_W) {
+            int val = g_state.piece_type;
+            if (i == g_state.piece_item_idx) {
+                val += g_state.piece_item_type * 10;
+            }
+            g_state.board[r][c] = val;
+        }
+    }
+
+    /* apply global gravity to eliminate floating blocks */
+    for (int c = 0; c < BOARD_W; c++) {
+        apply_column_gravity(c);
+    }
+}
+
+/* Clear completed lines */
+static int clear_lines(void) {
+    int cleared = 0;
+    for (int r = BOARD_H - 1; r >= 0; r--) {
+        int full = 1;
+        for (int c = 0; c < BOARD_W; c++)
+            if (g_state.board[r][c] == 0) { full = 0; break; }
+        if (full) {
+            cleared++;
+            /* Mine items from the cleared line */
+            for (int c = 0; c < BOARD_W; c++) {
+                if (g_state.board[r][c] >= 10) {
+                    give_item(g_state.board[r][c] / 10);
+                }
+            }
+            /* check if character is on this line - push up */
+            if (g_state.ch.y == r) {
+                if (r > 0) g_state.ch.y = r - 1;
+            } else if (g_state.ch.y < r) {
+                g_state.ch.y++;  /* shift down with the blocks above */
+            }
+            /* shift everything above down */
+            for (int rr = r; rr > 0; rr--)
+                memcpy(g_state.board[rr], g_state.board[rr-1],
+                       sizeof(int) * BOARD_W);
+            memset(g_state.board[0], 0, sizeof(int) * BOARD_W);
+            r++;  /* re-check this row */
+        }
+    }
+    return cleared;
+}
+
+/* Spawn new piece */
+static void spawn_piece(void) {
+    g_state.piece_type = g_state.next_type;
+    g_state.piece_rot  = 0;
+    g_state.piece_r    = 0;
+    g_state.piece_c    = BOARD_W / 2;
+    g_state.next_type  = random_piece();
+
+    /* 50% chance to spawn an item */
+    if (rand() % 100 < 50) {
+        g_state.piece_item_idx = rand() % 4;
+        g_state.piece_item_type = (rand() % 4) + 1; /* 1..4 */
+    } else {
+        g_state.piece_item_idx = -1;
+        g_state.piece_item_type = 0;
+    }
+
+    /* game over check */
+    if (!piece_valid(g_state.piece_type, g_state.piece_rot,
+                     g_state.piece_r, g_state.piece_c)) {
+        g_state.game_over = 1;
+        save_highscore();
+    }
+}
+
+/* ──────────── Scoring ──────────── */
+static void add_score(int lines_cleared) {
+    static const int pts[] = {0, 100, 300, 500, 800};
+    if (lines_cleared > 0 && lines_cleared <= 4)
+        g_state.score += pts[lines_cleared] * g_state.level;
+    g_state.lines += lines_cleared;
+    g_state.level = 1 + g_state.lines / 10;
+}
+
+/* ──────────── Column Gravity ──────────── */
+static void apply_column_gravity(int col) {
+    for (int r = BOARD_H - 1; r > 0; r--) {
+        if (g_state.board[r][col] == 0) {
+            for (int rr = r - 1; rr >= 0; rr--) {
+                if (g_state.board[rr][col] != 0) {
+                    g_state.board[r][col] = g_state.board[rr][col];
+                    g_state.board[rr][col] = 0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* ──────────── Character Physics ──────────── */
+static int char_on_ground(void) {
+    if (g_state.ch.y >= BOARD_H - 1) return 1;
+    if (g_state.board[g_state.ch.y + 1][g_state.ch.x] != 0) return 1;
+    return 0;
+}
+
+static void character_physics(void) {
+    if (g_state.ch.stun_timer > 0) return;
+
+    if (g_state.ch.jump_vel > 0) {
+        int ny = g_state.ch.y - 1;
+        if (ny >= 0 && g_state.board[ny][g_state.ch.x] == 0) {
+            g_state.ch.y = ny;
+            g_state.ch.jump_vel--;
+            /* cancel drill if moving */
+            g_state.ch.drill_crack_timer = 0;
+        } else {
+            g_state.ch.jump_vel = 0;
+        }
+    } else {
+        int ny = g_state.ch.y + 1;
+        if (ny < BOARD_H && g_state.board[ny][g_state.ch.x] == 0) {
+            g_state.ch.y = ny;
+            /* cancel drill if falling */
+            g_state.ch.drill_crack_timer = 0;
+        }
+    }
+}
+
+/* ──────────── Process Input ──────────── */
+static void process_tetris_input(int key) {
+    if (g_state.game_over) return;
+    if (g_state.attacker_stun_timer > 0) return; /* attacker is stunned */
+    if (g_state.piece_type == 0 || g_state.attacker_spawn_delay > 0) return;
+
+    int nr, nc, nrot;
+    switch (key) {
+    case K_LEFT:
+        nc = g_state.piece_c - 1;
+        if (piece_valid(g_state.piece_type, g_state.piece_rot,
+                        g_state.piece_r, nc))
+            g_state.piece_c = nc;
+        break;
+    case K_RIGHT:
+        nc = g_state.piece_c + 1;
+        if (piece_valid(g_state.piece_type, g_state.piece_rot,
+                        g_state.piece_r, nc))
+            g_state.piece_c = nc;
+        break;
+    case K_ROTATE:
+        nrot = (g_state.piece_rot + 1) % 4;
+        if (piece_valid(g_state.piece_type, nrot,
+                        g_state.piece_r, g_state.piece_c))
+            g_state.piece_rot = nrot;
+        /* wall kick: try shifting left/right */
+        else if (piece_valid(g_state.piece_type, nrot,
+                             g_state.piece_r, g_state.piece_c - 1)) {
+            g_state.piece_rot = nrot;
+            g_state.piece_c--;
+        } else if (piece_valid(g_state.piece_type, nrot,
+                               g_state.piece_r, g_state.piece_c + 1)) {
+            g_state.piece_rot = nrot;
+            g_state.piece_c++;
+        }
+        break;
+    case K_SOFT_DROP:
+        nr = g_state.piece_r + 1;
+        if (piece_valid(g_state.piece_type, g_state.piece_rot, nr,
+                        g_state.piece_c)) {
+            g_state.piece_r = nr;
+            g_state.score += 1;
+        }
+        break;
+        case K_HARD_DROP:
+        while (piece_valid(g_state.piece_type, g_state.piece_rot,
+                           g_state.piece_r + 1, g_state.piece_c)) {
+            g_state.piece_r++;
+            g_state.score += 2;
+        }
+        lock_piece();
+        add_score(clear_lines());
+        g_state.piece_type = 0;
+        g_state.attacker_spawn_delay = 18; /* 0.6 sec delay */
+        break;
+    }
+}
+
+static void give_item(int item_type) {
+    if (item_type <= 0) return;
+    if (g_state.ch.inv_count < 3) {
+        g_state.ch.inventory[g_state.ch.inv_count++] = item_type;
+    } else {
+        /* full: shift left and drop oldest */
+        g_state.ch.inventory[0] = g_state.ch.inventory[1];
+        g_state.ch.inventory[1] = g_state.ch.inventory[2];
+        g_state.ch.inventory[2] = item_type;
+    }
+}
+
+static void process_char_input(int key) {
+    if (g_state.game_over) return;
+    if (g_state.ch.stun_timer > 0) return;
+
+    int nx, ny;
+    switch (key) {
+    case K_CH_LEFT:
+        g_state.ch.facing = -1;
+        nx = g_state.ch.x - 1;
+        if (nx >= 0) {
+            if (g_state.board[g_state.ch.y][nx] == 0) {
+                g_state.ch.x = nx;
+                g_state.ch.drill_crack_timer = 0;
+            } else if (g_state.ch.drill_timer > 0) {
+                /* Start cracking block */
+                if (g_state.ch.drill_target_x != nx || g_state.ch.drill_target_y != g_state.ch.y) {
+                    g_state.ch.drill_target_x = nx;
+                    g_state.ch.drill_target_y = g_state.ch.y;
+                    g_state.ch.drill_crack_timer = 15;
+                }
+            }
+        }
+        break;
+    case K_CH_RIGHT:
+        g_state.ch.facing = 1;
+        nx = g_state.ch.x + 1;
+        if (nx < BOARD_W) {
+            if (g_state.board[g_state.ch.y][nx] == 0) {
+                g_state.ch.x = nx;
+                g_state.ch.drill_crack_timer = 0;
+            } else if (g_state.ch.drill_timer > 0) {
+                /* Start cracking block */
+                if (g_state.ch.drill_target_x != nx || g_state.ch.drill_target_y != g_state.ch.y) {
+                    g_state.ch.drill_target_x = nx;
+                    g_state.ch.drill_target_y = g_state.ch.y;
+                    g_state.ch.drill_crack_timer = 15;
+                }
+            }
+        }
+        break;
+    case K_CH_UP:
+    case K_CH_JUMP:
+        if (char_on_ground() && g_state.ch.jump_vel == 0) {
+            g_state.ch.jump_vel = 3;
+            ny = g_state.ch.y - 1;
+            if (ny >= 0 && g_state.board[ny][g_state.ch.x] == 0) {
+                g_state.ch.y = ny;
+                g_state.ch.jump_vel--;
+            } else {
+                g_state.ch.jump_vel = 0;
+            }
+        }
+        break;
+    case K_CH_DOWN:
+        g_state.ch.facing = 0; /* aim down */
+        /* move down if possible */
+        ny = g_state.ch.y + 1;
+        if (ny < BOARD_H && g_state.board[ny][g_state.ch.x] == 0)
+            g_state.ch.y = ny;
+        break;
+    case K_CH_PICKUP:
+        if (g_state.ch.carrying == 0) {
+            int dx = (g_state.ch.facing == 0) ? 0 : g_state.ch.facing;
+            int dy = (g_state.ch.facing == 0) ? 1 : 0;
+            int tx = g_state.ch.x + dx;
+            int ty = g_state.ch.y + dy;
+            int picked = 0;
+            if (tx >= 0 && tx < BOARD_W && ty >= 0 && ty < BOARD_H &&
+                g_state.board[ty][tx] != 0) {
+                g_state.ch.carrying = g_state.board[ty][tx] % 10;
+                if (g_state.board[ty][tx] >= 10) {
+                    give_item(g_state.board[ty][tx] / 10);
+                }
+                g_state.board[ty][tx] = 0;
+                apply_column_gravity(tx);
+                add_score(clear_lines());
+                picked = 1;
+            }
+            if (!picked && g_state.ch.facing != 0) {
+                ty = g_state.ch.y + 1;
+                if (tx >= 0 && tx < BOARD_W && ty >= 0 && ty < BOARD_H &&
+                    g_state.board[ty][tx] != 0) {
+                    g_state.ch.carrying = g_state.board[ty][tx] % 10;
+                    if (g_state.board[ty][tx] >= 10) {
+                        give_item(g_state.board[ty][tx] / 10);
+                    }
+                    g_state.board[ty][tx] = 0;
+                    apply_column_gravity(tx);
+                    add_score(clear_lines());
+                }
+            }
+        } else {
+            int dx = (g_state.ch.facing == 0) ? 0 : g_state.ch.facing;
+            int dy = (g_state.ch.facing == 0) ? 1 : 0;
+            int tx = g_state.ch.x + dx;
+            int ty = g_state.ch.y + dy;
+            if (tx >= 0 && tx < BOARD_W && ty >= 0 && ty < BOARD_H &&
+                g_state.board[ty][tx] == 0) {
+                g_state.board[ty][tx] = g_state.ch.carrying;
+                g_state.ch.carrying = 0;
+                apply_column_gravity(tx);
+                add_score(clear_lines());
+            }
+        }
+        break;
+    case K_CH_ITEM:
+        if (g_state.ch.inv_count > 0) {
+            int item = g_state.ch.inventory[0];
+            /* shift items */
+            for (int i = 0; i < 2; i++) {
+                g_state.ch.inventory[i] = g_state.ch.inventory[i+1];
+            }
+            g_state.ch.inv_count--;
+            
+            if (item == 1) {
+                /* Bomb: clear 4x4 around character and mine items */
+                int sx = g_state.ch.x - 2;
+                int sy = g_state.ch.y - 2;
+                for (int r = sy; r < sy + 4; r++) {
+                    for (int c = sx; c < sx + 4; c++) {
+                        if (r >= 0 && r < BOARD_H && c >= 0 && c < BOARD_W) {
+                            if (g_state.board[r][c] >= 10) {
+                                give_item(g_state.board[r][c] / 10);
+                            }
+                            g_state.board[r][c] = 0;
+                        }
+                    }
+                }
+                for (int c = sx; c < sx + 4; c++) {
+                    if (c >= 0 && c < BOARD_W) apply_column_gravity(c);
+                }
+                add_score(clear_lines());
+            } else if (item == 2) {
+                /* Drill: activate for 3 seconds */
+                g_state.ch.drill_timer = 90;
+            } else if (item == 3) {
+                /* Shield: activate for 1 second */
+                g_state.ch.shield_timer = 30;
+            } else if (item == 4) {
+                /* Gun: damage attacker */
+                g_state.attacker_hp--;
+                if (g_state.attacker_hp <= 0) {
+                    g_state.attacker_hp = 0;
+                    g_state.game_over = 1;
+                }
+            }
+        }
+        break;
+    }
+}
+
+/* ──────────── Broadcast State ──────────── */
+static void broadcast_state(void) {
+    for (int i = 0; i < g_num_clients; i++) {
+        int msg_type = MSG_STATE;
+        if (send_all(g_clients[i], &msg_type, sizeof(int)) < 0 ||
+            send_all(g_clients[i], &g_state, sizeof(GameState)) < 0) {
+            /* client disconnected */
+        }
+    }
+}
+
+/* ──────────── Client Reader Thread ──────────── */
+typedef struct {
+    int fd;
+    int role;  /* 0=tetris, 1=character */
+} ClientArg;
+
+static void *client_reader(void *arg) {
+    ClientArg *ca = (ClientArg *)arg;
+    MsgInput msg;
+
+    while (g_running) {
+        if (recv_all(ca->fd, &msg, sizeof(MsgInput)) < 0)
+            break;
+        if (msg.type != MSG_INPUT) continue;
+
+        pthread_mutex_lock(&g_lock);
+        if (msg.key == K_QUIT) {
+            g_running = 0;
+        } else if (ca->role == 0) {
+            process_tetris_input(msg.key);
+        } else {
+            process_char_input(msg.key);
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+
+    free(ca);
+    return NULL;
+}
+
+/* ──────────── Auto-drop Timer ──────────── */
+static int drop_counter = 0;
+static int gravity_counter = 0;
+
+static void game_tick(void) {
+    if (!g_state.game_started || g_state.game_over) return;
+
+    /* character stun countdown */
+    if (g_state.ch.stun_timer > 0)
+        g_state.ch.stun_timer--;
+
+    /* attacker stun countdown */
+    if (g_state.attacker_stun_timer > 0)
+        g_state.attacker_stun_timer--;
+
+    /* shield countdown */
+    if (g_state.ch.shield_timer > 0)
+        g_state.ch.shield_timer--;
+
+    /* drill countdown */
+    if (g_state.ch.drill_timer > 0)
+        g_state.ch.drill_timer--;
+
+    /* drill cracking countdown */
+    if (g_state.ch.drill_crack_timer > 0) {
+        g_state.ch.drill_crack_timer--;
+        if (g_state.ch.drill_crack_timer == 0) {
+            /* Drill finishes */
+            if (g_state.board[g_state.ch.drill_target_y][g_state.ch.drill_target_x] >= 10) {
+                give_item(g_state.board[g_state.ch.drill_target_y][g_state.ch.drill_target_x] / 10);
+            }
+            g_state.board[g_state.ch.drill_target_y][g_state.ch.drill_target_x] = 0;
+            apply_column_gravity(g_state.ch.drill_target_x);
+            add_score(clear_lines());
+            g_state.ch.drill_target_x = -1;
+            g_state.ch.drill_target_y = -1;
+        }
+    }
+
+    /* attacker spawn delay countdown */
+    if (g_state.attacker_spawn_delay > 0) {
+        g_state.attacker_spawn_delay--;
+        if (g_state.attacker_spawn_delay == 0) {
+            spawn_piece();
+        }
+    }
+
+    /* character physics (dynamic rate for smoother jump & hang-time) */
+    gravity_counter++;
+    int phys_rate = 3;
+    if (g_state.ch.jump_vel == 3) phys_rate = 2;       /* fast lift-off */
+    else if (g_state.ch.jump_vel == 2) phys_rate = 3;  /* medium */
+    else if (g_state.ch.jump_vel == 1) phys_rate = 6;  /* floaty apex hang-time */
+    else phys_rate = 3;                                /* falling speed */
+
+    if (gravity_counter >= phys_rate) {
+        gravity_counter = 0;
+        character_physics();
+    }
+
+    /* auto-drop piece */
+    int drop_speed = INITIAL_DROP - (g_state.level - 1) * 2;
+    if (drop_speed < 3) drop_speed = 3;
+
+    if (g_state.piece_type == 0) return; /* waiting for spawn delay */
+
+    drop_counter++;
+    if (drop_counter >= drop_speed) {
+        drop_counter = 0;
+        if (piece_valid(g_state.piece_type, g_state.piece_rot,
+                        g_state.piece_r + 1, g_state.piece_c)) {
+            g_state.piece_r++;
+        } else {
+            /* lock piece */
+            lock_piece();
+            add_score(clear_lines());
+            g_state.piece_type = 0;
+            g_state.attacker_spawn_delay = 18; /* 0.6 sec delay */
+        }
+    }
+
+    /* check character collision with falling piece */
+    int cells[4][2];
+    piece_cells(g_state.piece_type, g_state.piece_rot,
+                g_state.piece_r, g_state.piece_c, cells);
+    if (char_hit_by_piece(cells) && g_state.ch.stun_timer == 0) {
+        g_state.ch.stun_timer = STUN_TICKS;
+    }
+}
+
+/* ──────────── Main ──────────── */
+int main(int argc, char *argv[]) {
+    int port = DEFAULT_PORT;
+    if (argc > 1) port = atoi(argv[1]);
+
+    /* set up signal handlers */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    load_highscore();
+    init_game();
+
+    /* create server socket */
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); exit(1); }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(server_fd); exit(1);
+    }
+    if (listen(server_fd, MAX_CLIENTS) < 0) {
+        perror("listen"); close(server_fd); exit(1);
+    }
+
+    printf("[Server] Listening on port %d\n", port);
+    printf("[Server] Waiting for 2 players to connect...\n");
+
+    /* accept 2 clients */
+    pthread_t reader_threads[MAX_CLIENTS];
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct sockaddr_in cli_addr;
+        socklen_t cli_len = sizeof(cli_addr);
+        int cfd = accept(server_fd, (struct sockaddr *)&cli_addr, &cli_len);
+        if (cfd < 0) {
+            if (!g_running) break;
+            perror("accept");
+            continue;
+        }
+
+        g_clients[i] = cfd;
+        g_num_clients++;
+
+        /* send role assignment */
+        MsgRole role_msg;
+        role_msg.type = MSG_ROLE;
+        role_msg.role = i;
+        send_all(cfd, &role_msg, sizeof(MsgRole));
+
+        printf("[Server] Player %d connected (%s) from %s\n",
+               i + 1, i == 0 ? "Tetris" : "Character",
+               inet_ntoa(cli_addr.sin_addr));
+
+        /* start reader thread */
+        ClientArg *ca = malloc(sizeof(ClientArg));
+        ca->fd   = cfd;
+        ca->role = i;
+        pthread_create(&reader_threads[i], NULL, client_reader, ca);
+    }
+
+    if (g_num_clients == MAX_CLIENTS) {
+        printf("[Server] Both players connected! Game starting.\n");
+        g_state.game_started = 1;
+    }
+
+    /* ──── Game Loop ──── */
+    struct timespec ts;
+    while (g_running && !g_state.game_over) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long start_us = ts.tv_sec * 1000000L + ts.tv_nsec / 1000;
+
+        pthread_mutex_lock(&g_lock);
+        game_tick();
+        broadcast_state();
+        pthread_mutex_unlock(&g_lock);
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long end_us = ts.tv_sec * 1000000L + ts.tv_nsec / 1000;
+        long elapsed = end_us - start_us;
+        if (elapsed < TICK_US)
+            usleep(TICK_US - elapsed);
+    }
+
+    /* game over - send final state */
+    pthread_mutex_lock(&g_lock);
+    broadcast_state();
+    save_highscore();
+    pthread_mutex_unlock(&g_lock);
+
+    printf("[Server] Game Over! Score: %d  High Score: %d\n",
+           g_state.score, g_highscore);
+
+    /* cleanup */
+    usleep(500000);  /* let clients read final state */
+    for (int i = 0; i < g_num_clients; i++)
+        close(g_clients[i]);
+    close(server_fd);
+
+    return 0;
+}
